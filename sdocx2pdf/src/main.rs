@@ -16,7 +16,10 @@ use krilla::{
 use log::{info, warn};
 use sdocx::{Document, DocumentError, MediaStorage};
 
-use crate::page::{EmbedMap, PageConversionCtx};
+use crate::{
+    page::{EmbedMap, PageConversionCtx},
+    tool::ToolOptions,
+};
 
 mod page;
 mod pdf;
@@ -46,6 +49,17 @@ fn parse_stroke_width_mul(s: &str) -> Result<f32, String> {
     // !!! - Do not change these bounds without updating the help text for the CLI options.
     let v @ 0.01..=10.0 = s.parse::<f32>().map_err(|e| e.to_string())? else {
         return Err("multiplier must be between 0.01 and 10.0 (inclusive)".to_string());
+    };
+
+    Ok(v)
+}
+
+fn parse_nib_angle(s: &str) -> Result<f32, String> {
+    // A nib is symmetrical about its centre, so angles outside this range are just repetitions of
+    // ones inside it.
+    // !!! - Do not change these bounds without updating the help text for the CLI option.
+    let v @ 0.0..=180.0 = s.parse::<f32>().map_err(|e| e.to_string())? else {
+        return Err("angle must be between 0 and 180 degrees (inclusive)".to_string());
     };
 
     Ok(v)
@@ -141,6 +155,25 @@ struct Args {
     )]
     marker_width_multiplier: f32,
 
+    /// Specifies the angle at which the calligraphy pen's chisel-shaped nib is held, measured
+    /// anticlockwise from the horizontal as the page is seen by the reader.
+    ///
+    /// Strokes drawn across the nib are as wide as the nib is long, and strokes drawn along it are
+    /// only as wide as the nib is thick, so this angle determines which strokes come out thick and
+    /// which come out thin. The default of 45 degrees matches Samsung Notes, which offsets the
+    /// nib by a fixed diagonal vector.
+    ///
+    /// Samsung's renderer always uses a fixed 45-degree nib; the tilt and orientation data in the
+    /// file only affects the pen's end caps. This option exists to let you experiment.
+    #[arg(
+        long,
+        default_value_t = 45.0,
+        value_parser = parse_nib_angle,
+        help = "Angle in degrees at which the calligraphy pen's nib is held, from 0 to 180",
+        long_help
+    )]
+    calligraphy_nib_angle: f32,
+
     // !!! - Do not rename this without changing `DETAILED_ERRORS_ARG_NAME` to match.
     #[arg(
         long,
@@ -156,6 +189,12 @@ fn create_document_pdf(
     args: &Args,
 ) -> Result<krilla::Document, anyhow::Error> {
     let mut pdf = krilla::Document::new();
+
+    let tool_options = ToolOptions {
+        pen_width_mul: args.pen_width_multiplier.into(),
+        marker_width_mul: args.marker_width_multiplier.into(),
+        nib_angle_deg: args.calligraphy_nib_angle.into(),
+    };
 
     // An inline object with `index_in_text == k` is represented in the raw string by an object
     // replacement character (U+FFFC) at character index `k`. Thus, if the entire raw string
@@ -247,21 +286,12 @@ fn create_document_pdf(
         }
 
         for inline_obj in page.inline_objects() {
-            if let Err(err) = page_ctx.draw_single_object(
-                &inline_obj.object,
-                args.pen_width_multiplier,
-                args.marker_width_multiplier,
-            ) {
+            if let Err(err) = page_ctx.draw_single_object(&inline_obj.object, tool_options) {
                 err.log();
             }
         }
 
-        page_ctx.draw_objects(
-            page.objects(),
-            args.pen_width_multiplier,
-            args.marker_width_multiplier,
-            multi_progress,
-        );
+        page_ctx.draw_objects(page.objects(), tool_options, multi_progress);
     }
 
     Ok(pdf)

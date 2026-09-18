@@ -397,6 +397,18 @@ impl Stroke {
         self.pen_name.as_ref()
     }
 
+    pub const fn advanced_pen_settings(&self) -> Option<&Rc<str>> {
+        self.advanced_pen_settings.as_ref()
+    }
+
+    pub const fn size_level(&self) -> Option<u32> {
+        self.size_level
+    }
+
+    pub const fn original_width(&self) -> Option<u32> {
+        self.original_width
+    }
+
     pub const fn colour(&self) -> [u8; 4] {
         self.colour
     }

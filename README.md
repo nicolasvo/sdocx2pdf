@@ -40,11 +40,10 @@ text, web links or paintings in output PDFs. It can still process documents that
 features, however. I intend to improve sdocx2pdf by adding support for these things in the future.
 
 Another current limitation of sdocx2pdf is that it does not precisely replicate the features of all
-the various writing tools. For example, the calligraphy pen looks exactly the same as the fountain
-pen because I have not yet invested any time in trying to make it look like it does in SNotes.
-Similarly, the pencil, calligraphy brush and ink pen are not yet distinguished from the fountain
-pen. Also, dotted and dashed lines currently render as solid, and tape patterns do not work. All of
-this will hopefully improve with time.
+the various writing tools. The calligraphy pen is rendered as a chisel-tipped nib like SNotes'
+(based on reverse engineering Samsung's renderer), but the pencil, calligraphy brush and ink pen
+are not yet distinguished from the fountain pen. Also, dotted and dashed lines currently render as
+solid, and tape patterns do not work. All of this will hopefully improve with time.
 
 <!-- prettier-ignore -->
 > [!TIP]
@@ -122,7 +121,7 @@ Arguments:
   <IN>
           The path to the Samsung Notes document to be converted. This is typically an
           SDOCX file (.sdocx).
-
+          
           The Windows app stores unexported documents as directories that have the same
           internal structure as SDOCX files. You can also pass the path to one of these
           directories, or to a directory containing the contents of an unzipped SDOCX
@@ -136,14 +135,14 @@ Options:
       --auto-split
           Inserts page breaks into pageless documents between pages of any embedded PDFs.
           Disabled by default.
-
+          
           By default, a pageless document will be converted to a PDF containing a long
           single page. With auto-splitting enabled, if a pageless document embeds any
           PDFs, page breaks are inserted to match the page breaks in the embedded PDFs.
           For example, if you import a five-page PDF into a blank pageless document and
           annotate it, auto-splitting will give you a five-page PDF rather than a
           single-page PDF.
-
+          
           This option does nothing when converting a paged document. It also does nothing
           for pageless documents that do not embed any PDFs; see the basic splitting
           option.
@@ -152,7 +151,7 @@ Options:
           Specifies the page-splitting behaviour used for pageless documents when
           auto-splitting is not in effect, either because it is disabled or because the
           document being converted does not embed any PDFs.
-
+          
           Basic splitting is disabled by default, resulting in long single-page PDFs when
           auto-splitting is not used. To use basic splitting only, specify a mode and do
           not enable auto-splitting. When basic splitting and auto-splitting are both
@@ -170,21 +169,36 @@ Options:
       --pen-width-multiplier <PEN_WIDTH_MULTIPLIER>
           Specifies a multiplier for the widths of the fountain pen, calligraphy pen, ink
           pen, calligraphy brush and pencil.
-
+          
           Minimum is 0.01 (1% of the usual width); maximum is 10 (10 times the usual
           width). For example, choosing a value of 2 (or 2.0) doubles the width of
           anything drawn with one of those tools.
-
+          
           [default: 1]
 
       --marker-width-multiplier <MARKER_WIDTH_MULTIPLIER>
           Specifies a multiplier for the widths of the marker pen and highlighter.
-
+          
           Minimum is 0.01 (1% of the usual width); maximum is 10 (10 times the usual
           width). For example, choosing a value of 2 (or 2.0) doubles the width of
           anything drawn with one of those tools.
-
+          
           [default: 1]
+
+      --calligraphy-nib-angle <CALLIGRAPHY_NIB_ANGLE>
+          Specifies the angle at which the calligraphy pen's chisel-shaped nib is held,
+          measured anticlockwise from the horizontal as the page is seen by the reader.
+          
+          Strokes drawn across the nib are as wide as the nib is long, and strokes drawn
+          along it are only as wide as the nib is thick, so this angle determines which
+          strokes come out thick and which come out thin. The default of 45 degrees
+          matches Samsung Notes, which offsets the nib by a fixed diagonal vector.
+          
+          Samsung's renderer always uses a fixed 45-degree nib; the tilt and orientation
+          data in the file only affects the pen's end caps. This option exists to let you
+          experiment.
+          
+          [default: 45]
 
       --detailed-errors
           Show (very) detailed error messages if opening/parsing/converting fails

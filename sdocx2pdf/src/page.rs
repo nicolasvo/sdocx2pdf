@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::{
     BasicSplitMode, pdf,
     shape::{NoStyleError, PathDrawingCtx, PathDrawingError},
-    tool::{EventGroup, Tool},
+    tool::{EventGroup, Tool, ToolOptions},
 };
 
 const A4_PORTRAIT_WIDTH_PT: f64 = 210.0 * 2.84526;
@@ -850,15 +850,14 @@ impl<'s> PageConversionCtx<'s> {
     pub fn draw_single_object(
         &mut self,
         object: &sdocx::DocObject,
-        pen_width_mul: f32,
-        marker_width_mul: f32,
+        tool_options: ToolOptions,
     ) -> Result<(), DrawObjectError> {
         match object {
             sdocx::DocObject::Stroke(stroke) => self
                 .draw_stroke_chunk_events(
                     [EventGroup::from_stroke(stroke)],
                     &self.boundary_path(),
-                    Tool::for_stroke(stroke).with_scaled_width(pen_width_mul, marker_width_mul),
+                    Tool::for_stroke(stroke, tool_options),
                 )
                 .map_err(|()| DrawObjectError::Stroke),
 
@@ -892,8 +891,7 @@ impl<'s> PageConversionCtx<'s> {
     pub fn draw_objects<'d>(
         &mut self,
         objects: impl ExactSizeIterator<Item = &'d DocObject>,
-        pen_width_mul: f32,
-        marker_width_mul: f32,
+        tool_options: ToolOptions,
         multi_progress: &MultiProgress,
     ) {
         let objects_bar = multi_progress
@@ -913,9 +911,7 @@ impl<'s> PageConversionCtx<'s> {
         let chunked_objects = objects
             .inspect(|_| objects_bar.inc(1))
             .chunk_by(|&obj| match obj {
-                sdocx::DocObject::Stroke(stroke) => Some(
-                    Tool::for_stroke(stroke).with_scaled_width(pen_width_mul, marker_width_mul),
-                ),
+                sdocx::DocObject::Stroke(stroke) => Some(Tool::for_stroke(stroke, tool_options)),
                 _non_stroke => None,
             });
 
@@ -945,7 +941,7 @@ impl<'s> PageConversionCtx<'s> {
 
             // This is a chunk of non-strokes.
             for obj in objects {
-                if let Err(err) = self.draw_single_object(obj, pen_width_mul, marker_width_mul) {
+                if let Err(err) = self.draw_single_object(obj, tool_options) {
                     err.log();
                 }
             }

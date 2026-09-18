@@ -557,6 +557,11 @@ impl ContinuousStroke {
         }
     }
 
+    /// Returns the arc length at the end of the stroke.
+    pub fn length(&self) -> f64 {
+        self.length
+    }
+
     pub fn position(&self, s: f64) -> (f64, f64) {
         let x = self.x.evaluate(s).expect("arc length out of range");
         (x, self.y.evaluate(s).unwrap())

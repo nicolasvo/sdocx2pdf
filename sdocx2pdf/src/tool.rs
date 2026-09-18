@@ -72,10 +72,152 @@ impl Basics {
     }
 }
 
+/// Options affecting the way tools are drawn.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub struct ToolOptions {
+    /// Multiplier for the widths of the handwriting pens.
+    pub pen_width_mul: OrderedFloat<f32>,
+
+    /// Multiplier for the widths of the highlighters and marker pens.
+    pub marker_width_mul: OrderedFloat<f32>,
+
+    /// The angle of the calligraphy pen's nib edge, measured anticlockwise from the horizontal as
+    /// the page is seen by the reader, in degrees.
+    pub nib_angle_deg: OrderedFloat<f32>,
+}
+
+/// The length of the calligraphy pen's nib edge, as a multiple of the pen size.
+///
+/// This is derived from Samsung's implementation (see `libSPenObliquePen.so`): the stroke body is
+/// a ribbon whose edges are offset from the centreline by a fixed diagonal vector of length equal
+/// to the pen size, making the widest strokes (those perpendicular to the nib edge) `sqrt(2)`
+/// times the pen size wide.
+///
+/// A decompiled Samsung Notes APK with these libraries is at
+/// <https://github.com/Yanndroid/Samsung-Notes-Port> (each preload pen has its own
+/// `libSPen<PenName>.so`). The ribbon construction is in
+/// `SPen::ObliquePenStrokeDrawableRTV1::lineToMesh`: the four segment corners are the endpoints
+/// offset by `(±penSize / 2, ∓penSize / 2)`, widened by miter-style skirts. The stroke direction
+/// is the only input to the width; pressure, tilt and orientation are used only by the end-cap
+/// (`ObliquePenStrokeTipDrawableRT`).
+const NIB_LENGTH_PER_PEN_SIZE: f64 = 1.35;
+
+/// The thickness of the calligraphy pen's nib, as a fraction of the length of its edge. This is
+/// what stops strokes drawn along the nib angle from disappearing entirely. Samsung's renderer
+/// produces near-zero width in that direction (the miter skirts are all that remain), so this is
+/// small.
+const NIB_THICKNESS_RATIO: f64 = 0.15;
+
+/// The shape and orientation of the chisel-shaped nib of a calligraphy pen.
+///
+/// The nib is modelled as an ellipse whose major axis lies along the nib edge. Sweeping that
+/// ellipse along the stroke gives the wide/narrow contrast that characterises calligraphic
+/// writing: strokes drawn across the nib edge are as wide as the nib is long, whereas those drawn
+/// along it are only as wide as the nib is thick.
+#[derive(Clone, Copy)]
+struct Nib {
+    /// Unit vector along the nib edge, in document space.
+    edge_direction: Vector2d,
+
+    /// Half the length of the nib edge.
+    half_length: f64,
+
+    /// Half the thickness of the nib.
+    half_thickness: f64,
+}
+
+impl Nib {
+    fn new(angle_deg: f64, pen_size: f64) -> Nib {
+        let angle = angle_deg.to_radians();
+        let half_length = 0.5 * NIB_LENGTH_PER_PEN_SIZE * pen_size;
+
+        Nib {
+            // The y axis of document space points down the page, so an angle measured
+            // anticlockwise as the reader sees it is clockwise in document space.
+            edge_direction: Vector2d::new(angle.cos(), -angle.sin()),
+            half_length,
+            half_thickness: half_length * NIB_THICKNESS_RATIO,
+        }
+    }
+
+    /// Returns the distance from the centre of the nib to the edge of the mark it leaves when
+    /// moved in the direction of the unit vector `tangent`, measured perpendicular to `tangent`.
+    ///
+    /// This is the support width of the nib ellipse in the direction across the stroke, so
+    /// offsetting the stroke's centreline by this amount on each side gives the outline of the
+    /// mark.
+    fn half_width_across(&self, tangent: Vector2d) -> f64 {
+        if !tangent.is_finite() {
+            // We have no direction to work with, so use something between the two extremes.
+            return 0.5 * (self.half_length + self.half_thickness);
+        }
+
+        // Sine and cosine of the angle between the direction of travel and the nib edge.
+        let sin = tangent.cross(self.edge_direction).abs();
+        let cos = tangent.dot(self.edge_direction).abs();
+
+        (self.half_length * sin).hypot(self.half_thickness * cos)
+    }
+
+    /// Appends the mark left by the nib resting at `centre` to `path_builder`.
+    fn append_mark(&self, centre: Point2d, path_builder: &mut PathBuilder) {
+        let half_edge = self.edge_direction * self.half_length;
+
+        append_simple_line(
+            [
+                (centre - half_edge, self.half_thickness),
+                (centre + half_edge, self.half_thickness),
+            ],
+            true,
+            path_builder,
+        );
+    }
+}
+
+/// How the width of the mark made by a tool is determined at a point along a stroke.
+#[derive(Clone, Copy)]
+enum Spread {
+    /// A round nib, whose radius is determined by the pressure (or by `pressure_override` in place
+    /// of it, for tools that ignore pressure).
+    Round {
+        pen_size: f64,
+        pressure_override: Option<f64>,
+    },
+
+    /// A chisel-shaped nib, whose width depends on the direction of travel.
+    Chisel(Nib),
+}
+
+impl Spread {
+    /// Returns the half-width of the mark made by the tool, measured across the stroke, when it is
+    /// moved in the direction of the unit vector `tangent` under pressure `pressure`.
+    fn half_width_across(&self, pressure: f64, tangent: Vector2d) -> f64 {
+        match *self {
+            Spread::Round {
+                pen_size,
+                pressure_override,
+            } => pressure_to_circle_radius(pressure_override.unwrap_or(pressure), pen_size),
+
+            Spread::Chisel(nib) => nib.half_width_across(tangent),
+        }
+    }
+
+    fn nib(&self) -> Option<Nib> {
+        match *self {
+            Spread::Round { .. } => None,
+            Spread::Chisel(nib) => Some(nib),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum Tool {
     FountainPen(Basics),
-    CalligraphyPen(Basics),
+    CalligraphyPen {
+        basics: Basics,
+        /// Angle of the nib edge in degrees. See [`ToolOptions::nib_angle_deg`].
+        nib_angle_deg: OrderedFloat<f32>,
+    },
     InkPen { basics: Basics, fixed_width: bool },
     Pencil { basics: Basics, fixed_opacity: bool },
     CalligraphyBrush(Basics),
@@ -97,7 +239,7 @@ enum ToolPropertyError {
 }
 
 impl Tool {
-    fn try_for_stroke(stroke: &Stroke) -> Result<Tool, ToolPropertyError> {
+    fn try_for_stroke(stroke: &Stroke, options: ToolOptions) -> Result<Tool, ToolPropertyError> {
         let name = stroke.pen_name().ok_or(ToolPropertyError::NoName)?;
 
         let basics = Basics {
@@ -108,7 +250,10 @@ impl Tool {
 
         Ok(match name.as_ref() {
             "com.samsung.android.sdk.pen.pen.preload.FountainPen" => Tool::FountainPen(basics),
-            "com.samsung.android.sdk.pen.pen.preload.ObliquePen" => Tool::CalligraphyPen(basics),
+            "com.samsung.android.sdk.pen.pen.preload.ObliquePen" => Tool::CalligraphyPen {
+                basics,
+                nib_angle_deg: options.nib_angle_deg,
+            },
             "com.samsung.android.sdk.pen.pen.preload.InkPen2" => Tool::InkPen {
                 basics,
                 fixed_width: stroke.is_fixed_width(),
@@ -139,18 +284,20 @@ impl Tool {
         })
     }
 
-    pub fn for_stroke(stroke: &Stroke) -> Tool {
-        Self::try_for_stroke(stroke).unwrap()
+    pub fn for_stroke(stroke: &Stroke, options: ToolOptions) -> Tool {
+        Self::try_for_stroke(stroke, options)
+            .unwrap()
+            .with_scaled_width(options)
     }
 
-    pub fn with_scaled_width(mut self, handwriting_mul: f32, marker_mul: f32) -> Tool {
+    fn with_scaled_width(mut self, options: ToolOptions) -> Tool {
         let like_hl = self.is_like_highlighter();
         let basics = self.basics_mut();
 
         *basics = if like_hl {
-            basics.with_scaled_width(marker_mul)
+            basics.with_scaled_width(options.marker_width_mul.0)
         } else {
-            basics.with_scaled_width(handwriting_mul)
+            basics.with_scaled_width(options.pen_width_mul.0)
         };
 
         self
@@ -159,7 +306,7 @@ impl Tool {
     fn basics(&self) -> &Basics {
         match self {
             Tool::FountainPen(basics)
-            | Tool::CalligraphyPen(basics)
+            | Tool::CalligraphyPen { basics, .. }
             | Tool::InkPen { basics, .. }
             | Tool::Pencil { basics, .. }
             | Tool::CalligraphyBrush(basics)
@@ -172,7 +319,7 @@ impl Tool {
     fn basics_mut(&mut self) -> &mut Basics {
         match self {
             Tool::FountainPen(basics)
-            | Tool::CalligraphyPen(basics)
+            | Tool::CalligraphyPen { basics, .. }
             | Tool::InkPen { basics, .. }
             | Tool::Pencil { basics, .. }
             | Tool::CalligraphyBrush(basics)
@@ -335,16 +482,40 @@ impl Tool {
         } else {
             // Increase the width for non-straight highlighters/markers.
             let size = if self.is_like_highlighter() {
-                size * 2.5
+                f64::from(size) * 2.5
             } else {
-                size
+                f64::from(size)
             };
 
-            let pressure_override = (!self.is_pressure_sensitive()).then_some(0.45);
+            // The calligraphy pen has a chisel-shaped nib held at a fixed angle, so its width
+            // comes from the direction of travel rather than from the pressure. Every other
+            // non-straight tool has a round nib.
+            let (spread, arc_mode, target_angle) = match *self {
+                Tool::CalligraphyPen { nib_angle_deg, .. } => (
+                    Spread::Chisel(Nib::new(nib_angle_deg.0.into(), size)),
+                    // The arcs are circular, so they are only the right shape for a round nib. A
+                    // chisel nib gets its ends from the shape of the nib itself instead, and does
+                    // not need anything at the joins because the width of a chisel nib varies
+                    // smoothly enough along the stroke for consecutive segments to meet flush.
+                    ArcMode::None,
+                    // A chisel nib changes width as the stroke turns, so segment more finely than
+                    // we need to for the shape alone.
+                    f64::to_radians(20.0),
+                ),
+
+                _ => (
+                    Spread::Round {
+                        pen_size: size,
+                        pressure_override: (!self.is_pressure_sensitive()).then_some(0.45),
+                    },
+                    ArcMode::All,
+                    f64::to_radians(40.0),
+                ),
+            };
 
             Either::Right(strokes.into_iter().filter_map(move |events| {
                 let mut pb = PathBuilder::new();
-                append_events_basic(events, size, pressure_override, ArcMode::All, &mut pb);
+                append_events_basic(events, spread, arc_mode, target_angle, &mut pb);
                 pb.finish()
             }))
         };
@@ -406,7 +577,7 @@ fn pressure_to_circle_radius(pressure: f64, pen_size: f64) -> f64 {
 
 fn append_bezier_pulley(
     points_tangents_radii: [(Point2d, Vector2d, f64); 4],
-    draw_arcs: bool,
+    arcs: SegmentArcs,
     last_segment_tan: &mut Option<Vector2d>,
     path_builder: &mut PathBuilder,
 ) -> Result<(), ()> {
@@ -507,64 +678,63 @@ fn append_bezier_pulley(
     let bottom_arc_lowest = start_pos - scaled_tangent_start;
     let top_arc_highest = end_pos + scaled_tangent_end;
 
-    let points = if draw_arcs {
-        let (
-            top_right_to_arc_highest_cps,
-            top_arc_highest_to_left_cps,
-            bottom_left_to_arc_lowest_cps,
-            bottom_arc_lowest_to_right_cps,
-        ) = (
-            bezier_arc_control_points(top_right, top_arc_highest, end_pos).ok_or(())?,
-            bezier_arc_control_points(top_arc_highest, top_left, end_pos).ok_or(())?,
-            bezier_arc_control_points(bottom_left, bottom_arc_lowest, start_pos).ok_or(())?,
-            bezier_arc_control_points(bottom_arc_lowest, bottom_right, start_pos).ok_or(())?,
-        );
+    // The arc that rounds off the end of the segment, if we want one. Without it, the outline runs
+    // straight from one side of the segment to the other, giving a flat end.
+    let end_arc = if arcs.end {
+        let top_right_to_arc_highest_cps =
+            bezier_arc_control_points(top_right, top_arc_highest, end_pos).ok_or(())?;
+        let top_arc_highest_to_left_cps =
+            bezier_arc_control_points(top_arc_highest, top_left, end_pos).ok_or(())?;
 
-        // Points from bottom left to top left
-        Either::Left(
-            bottom_to_top_right_points
+        Some(
+            top_right_to_arc_highest_cps
+                .map(Control)
                 .into_iter()
-                .chain(top_right_to_arc_highest_cps.map(Control))
                 .chain(std::iter::once(Normal(top_arc_highest)))
-                .chain(top_arc_highest_to_left_cps.map(Control))
-                .chain(top_to_bottom_left_points)
-                .chain({
-                    let it = if last_segment_tan.is_none_or(|tangent| {
-                        tangent.angle_to(scaled_tangent_start).radians.abs() > f64::to_radians(20.0)
-                    }) {
-                        // Either this is the first segment, in which case we need to round the
-                        // beginning, or there is a significant difference in tangent angle between
-                        // the final third of the previous segment and the start of this one. In
-                        // the latter case, we round the beginning to make the connection look
-                        // cleaner.
-                        Some(
-                            bottom_left_to_arc_lowest_cps
-                                .map(Control)
-                                .into_iter()
-                                .chain(std::iter::once(Normal(bottom_arc_lowest)))
-                                .chain(bottom_arc_lowest_to_right_cps.map(Control))
-                                .chain(std::iter::once(Normal(bottom_right))),
-                        )
-                    } else {
-                        None
-                    }
-                    .into_iter()
-                    .flatten();
-
-                    *last_segment_tan = Some(end_pos - pos_second_third);
-
-                    it
-                }),
+                .chain(top_arc_highest_to_left_cps.map(Control)),
         )
     } else {
-        Either::Right(
-            bottom_to_top_right_points
-                .into_iter()
-                .chain(top_to_bottom_left_points),
-        )
+        None
     };
 
-    pdf::specify_polygon(points, path_builder);
+    // Whether to round off the beginning of the segment. We do so if there is a significant
+    // difference in tangent angle between the final third of the previous segment and the start of
+    // this one, because that makes the connection look cleaner, or if this is the first segment
+    // and the caller wants the stroke to begin with a round end.
+    let want_start_arc = arcs.start
+        && last_segment_tan.is_none_or(|tangent| {
+            tangent.angle_to(scaled_tangent_start).radians.abs() > f64::to_radians(20.0)
+        });
+
+    let start_arc = if want_start_arc {
+        let bottom_left_to_arc_lowest_cps =
+            bezier_arc_control_points(bottom_left, bottom_arc_lowest, start_pos).ok_or(())?;
+        let bottom_arc_lowest_to_right_cps =
+            bezier_arc_control_points(bottom_arc_lowest, bottom_right, start_pos).ok_or(())?;
+
+        Some(
+            bottom_left_to_arc_lowest_cps
+                .map(Control)
+                .into_iter()
+                .chain(std::iter::once(Normal(bottom_arc_lowest)))
+                .chain(bottom_arc_lowest_to_right_cps.map(Control))
+                .chain(std::iter::once(Normal(bottom_right))),
+        )
+    } else {
+        None
+    };
+
+    *last_segment_tan = Some(end_pos - pos_second_third);
+
+    pdf::specify_polygon(
+        bottom_to_top_right_points
+            .into_iter()
+            .chain(end_arc.into_iter().flatten())
+            .chain(top_to_bottom_left_points)
+            .chain(start_arc.into_iter().flatten()),
+        path_builder,
+    );
+
     Ok(())
 }
 
@@ -791,7 +961,6 @@ fn append_simple_line(
 #[derive(Clone, Copy)]
 enum ArcMode {
     /// Do not draw any arcs.
-    #[expect(dead_code)]
     None,
 
     /// Draw arcs only on the first and last segments of the stroke.
@@ -802,30 +971,56 @@ enum ArcMode {
     All,
 }
 
-/// Draws `events` into `ops` using the basic unmodified stroke segmentation algorithm and a simple
-/// pressure-to-width conversion based on `pen_size`.
+/// Which ends of a stroke segment are to be rounded off with an arc.
+#[derive(Clone, Copy)]
+struct SegmentArcs {
+    start: bool,
+    end: bool,
+}
+
+impl SegmentArcs {
+    fn for_segment(mode: ArcMode, position: itertools::Position) -> SegmentArcs {
+        use itertools::Position::{First, Last, Only};
+
+        let (start, end) = match mode {
+            ArcMode::None => (false, false),
+            ArcMode::All => (true, true),
+
+            ArcMode::FirstLastOnly => {
+                let v = matches!(position, First | Last | Only);
+                (v, v)
+            }
+        };
+
+        SegmentArcs { start, end }
+    }
+
+    fn any(self) -> bool {
+        self.start || self.end
+    }
+}
+
+/// Draws `events` into `ops` using the basic unmodified stroke segmentation algorithm, with the
+/// width of the mark at each point determined by `spread`.
 ///
 /// The event positions must be in PDF space. It is assumed that the outline colour and line cap
 /// style are set up for drawing dots, and that the fill colour is set up for drawing segments.
 /// This function does not change the colours at any point, and is therefore unsuitable for drawing
 /// strokes with varying opacity. Tilt data, if present, is ignored.
 ///
-/// `use_arcs` determines whether stroke segments are rounded at the end(s). Arcs allow for
+/// `arc_mode` determines whether stroke segments are rounded at the end(s). Arcs allow for
 /// smoother connections, but increase the file size. They also necessarily overlap the next
 /// segment, making them inappropriate for strokes with transparency (because you can see the
 /// arcs).
+///
+/// `target_angle` is the change in tangent angle that the stroke is segmented to achieve.
 fn append_events_basic<'e>(
     events: EventGroup<'e>,
-    pen_size: f32,
-    pressure_override: Option<f64>,
+    spread: Spread,
     arc_mode: ArcMode,
+    target_angle: f64,
     path_builder: &mut PathBuilder,
 ) {
-    let pen_size: f64 = pen_size.into();
-
-    let pressure_to_circle_radius =
-        |p: f64, s: f64| -> f64 { pressure_to_circle_radius(pressure_override.unwrap_or(p), s) };
-
     let (events, filtering) = match events {
         EventGroup::Normal(events) => (events, FilteringMode::Raw),
         EventGroup::Shapeified(events) => (events, FilteringMode::Preprocessed),
@@ -836,26 +1031,58 @@ fn append_events_basic<'e>(
 
         StrokeOrDot::Dot { x, y, pressure } => {
             let pos: Point2d = (x, y).into();
-            let spread = pressure_to_circle_radius(pressure, pen_size);
 
-            // Draw a filled circle.
-            append_simple_line([(pos, spread), (pos, spread)], true, path_builder);
+            match spread.nib() {
+                // A chisel nib resting on the page leaves a mark shaped like the nib itself.
+                Some(nib) => nib.append_mark(pos, path_builder),
+
+                // Draw a filled circle.
+                None => {
+                    let radius = spread.half_width_across(pressure, Vector2d::zero());
+                    append_simple_line([(pos, radius), (pos, radius)], true, path_builder);
+                }
+            }
 
             return;
         }
     };
 
-    let target_angle = f64::to_radians(40.0);
     let sample_arc_lengths = smooth.sample_points(target_angle);
 
     let mut last_segment_tan: Option<Vector2d> = None;
 
+    // The tangent at an arc length, falling back to `fallback` if the interpolated tangent is
+    // degenerate.
+    let tangent_at = |s: f64, fallback: Vector2d| -> Vector2d {
+        Some(Vector2d::from(smooth.unit_tangent(s)).normalize())
+            .filter(|v| v.is_finite())
+            .unwrap_or(fallback)
+    };
+
     for (iter_pos, (start_s, end_s)) in sample_arc_lengths.tuple_windows().with_position() {
+        let first_third_s = start_s.lerp(end_s, 1.0 / 3.0);
+        let second_third_s = start_s.lerp(end_s, 2.0 / 3.0);
+
         let start_pos: Point2d = smooth.position(start_s).into();
+        let first_third_pos: Point2d = smooth.position(first_third_s).into();
+        let second_third_pos: Point2d = smooth.position(second_third_s).into();
         let end_pos: Point2d = smooth.position(end_s).into();
 
-        let start_spread = pressure_to_circle_radius(smooth.pressure(start_s), pen_size);
-        let end_spread = pressure_to_circle_radius(smooth.pressure(end_s), pen_size);
+        // Note that we use the same fallback tangent for both middle thirds.
+        let middle_fallback_tan = (second_third_pos - first_third_pos).normalize();
+
+        let start_tan = tangent_at(start_s, (first_third_pos - start_pos).normalize());
+        let first_third_tan = tangent_at(first_third_s, middle_fallback_tan);
+        let second_third_tan = tangent_at(second_third_s, middle_fallback_tan);
+        let end_tan = tangent_at(end_s, (end_pos - second_third_pos).normalize());
+
+        // The width of the mark can depend on the direction of travel, so the tangents have to be
+        // known before the spreads can be.
+        let spread_at =
+            |s: f64, tangent: Vector2d| spread.half_width_across(smooth.pressure(s), tangent);
+
+        let start_spread = spread_at(start_s, start_tan);
+        let end_spread = spread_at(end_s, end_tan);
 
         let visual_length = 0.5 * start_spread + (end_pos - start_pos).length() + 0.5 * end_spread;
 
@@ -864,61 +1091,27 @@ fn append_events_basic<'e>(
 
         let is_quite_short = is_very_short || visual_length < 0.7 * (start_spread + end_spread);
 
-        let want_arcs = match arc_mode {
-            ArcMode::All => true,
-            ArcMode::FirstLastOnly => !matches!(iter_pos, itertools::Position::Middle),
-            ArcMode::None => false,
-        };
+        let arcs = SegmentArcs::for_segment(arc_mode, iter_pos);
 
         // If the segment is not short, try drawing a Bézier pulley. If that doesn't work, or
         // if the segment is short, use a simpler method.
         if is_quite_short
             || append_bezier_pulley(
-                {
-                    let first_third_s = start_s.lerp(end_s, 1.0 / 3.0);
-                    let second_third_s = start_s.lerp(end_s, 2.0 / 3.0);
-
-                    let first_third_pos: Point2d = smooth.position(first_third_s).into();
-                    let second_third_pos: Point2d = smooth.position(second_third_s).into();
-
-                    [
-                        (
-                            start_pos,
-                            Some(Vector2d::from(smooth.unit_tangent(start_s)).normalize())
-                                .filter(|v| v.is_finite())
-                                .unwrap_or_else(|| (first_third_pos - start_pos).normalize()),
-                            start_spread,
-                        ),
-                        (
-                            first_third_pos,
-                            Some(Vector2d::from(smooth.unit_tangent(first_third_s)).normalize())
-                                .filter(|v| v.is_finite())
-                                // Note that we use the same fallback tangent for both middle
-                                // thirds.
-                                .unwrap_or_else(|| {
-                                    (second_third_pos - first_third_pos).normalize()
-                                }),
-                            pressure_to_circle_radius(smooth.pressure(first_third_s), pen_size),
-                        ),
-                        (
-                            second_third_pos,
-                            Some(Vector2d::from(smooth.unit_tangent(second_third_s)).normalize())
-                                .filter(|v| v.is_finite())
-                                .unwrap_or_else(|| {
-                                    (second_third_pos - first_third_pos).normalize()
-                                }),
-                            pressure_to_circle_radius(smooth.pressure(second_third_s), pen_size),
-                        ),
-                        (
-                            end_pos,
-                            Some(Vector2d::from(smooth.unit_tangent(end_s)).normalize())
-                                .filter(|v| v.is_finite())
-                                .unwrap_or_else(|| (end_pos - second_third_pos).normalize()),
-                            end_spread,
-                        ),
-                    ]
-                },
-                want_arcs,
+                [
+                    (start_pos, start_tan, start_spread),
+                    (
+                        first_third_pos,
+                        first_third_tan,
+                        spread_at(first_third_s, first_third_tan),
+                    ),
+                    (
+                        second_third_pos,
+                        second_third_tan,
+                        spread_at(second_third_s, second_third_tan),
+                    ),
+                    (end_pos, end_tan, end_spread),
+                ],
+                arcs,
                 &mut last_segment_tan,
                 path_builder,
             )
@@ -930,10 +1123,17 @@ fn append_events_basic<'e>(
 
             // If the segment is quite short but not very short, try drawing a simple pulley.
             // If that doesn't work, or if the segment is very short, draw a simple line.
-            if is_very_short || append_simple_pulley(points, want_arcs, path_builder).is_err() {
-                append_simple_line(points, want_arcs, path_builder);
+            if is_very_short || append_simple_pulley(points, arcs.any(), path_builder).is_err() {
+                append_simple_line(points, arcs.any(), path_builder);
             }
         }
+    }
+
+    // The segments have square ends, so stamp the nib down at each end of the stroke to give the
+    // flat, angled ends that a chisel nib leaves behind.
+    if let Some(nib) = spread.nib() {
+        nib.append_mark(smooth.position(0.0).into(), path_builder);
+        nib.append_mark(smooth.position(smooth.length()).into(), path_builder);
     }
 }
 
