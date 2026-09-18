@@ -557,11 +557,6 @@ impl ContinuousStroke {
         }
     }
 
-    /// Returns the arc length at the end of the stroke.
-    pub fn length(&self) -> f64 {
-        self.length
-    }
-
     pub fn position(&self, s: f64) -> (f64, f64) {
         let x = self.x.evaluate(s).expect("arc length out of range");
         (x, self.y.evaluate(s).unwrap())
@@ -684,6 +679,17 @@ pub struct SplitStroke {
     x: Vec<f64>,
     y: Vec<f64>,
     pressure: Vec<f64>,
+}
+
+impl SplitStroke {
+    /// Returns the deduplicated stroke points in order.
+    pub fn points(&self) -> Vec<(f64, f64)> {
+        self.x
+            .iter()
+            .copied()
+            .zip(self.y.iter().copied())
+            .collect()
+    }
 }
 
 pub enum StrokeOrDot {

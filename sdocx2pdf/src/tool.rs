@@ -103,17 +103,16 @@ pub struct ToolOptions {
 const NIB_LENGTH_PER_PEN_SIZE: f64 = 1.35;
 
 /// The thickness of the calligraphy pen's nib, as a fraction of the length of its edge. This is
-/// what stops strokes drawn along the nib angle from disappearing entirely. Samsung's renderer
-/// produces near-zero width in that direction (the miter skirts are all that remain), so this is
-/// small.
-const NIB_THICKNESS_RATIO: f64 = 0.15;
+/// what stops strokes drawn along the nib angle from disappearing entirely. Samsung's ribbon has
+/// zero ideal width in that direction, but the miter skirts of its mesh keep a minimum across-
+/// width of roughly 0.28 times half the pen size, so this is set to reproduce that floor.
+const NIB_THICKNESS_RATIO: f64 = 0.22;
 
 /// The shape and orientation of the chisel-shaped nib of a calligraphy pen.
 ///
-/// The nib is modelled as an ellipse whose major axis lies along the nib edge. Sweeping that
-/// ellipse along the stroke gives the wide/narrow contrast that characterises calligraphic
-/// writing: strokes drawn across the nib edge are as wide as the nib is long, whereas those drawn
-/// along it are only as wide as the nib is thick.
+/// The nib is modelled as Samsung models it: a line segment (the nib edge) held at a fixed angle,
+/// whose sweep along the stroke is the mark (see [`append_events_chisel`]). The nib thickness only
+/// sets a minimum stroke width, so that strokes drawn along the nib edge don't vanish entirely.
 #[derive(Clone, Copy)]
 struct Nib {
     /// Unit vector along the nib edge, in document space.
@@ -124,6 +123,9 @@ struct Nib {
 
     /// Half the thickness of the nib.
     half_thickness: f64,
+
+    /// The pen size, as `SmPath`'s divisor table reads it (`getSize()`).
+    size: f64,
 }
 
 impl Nib {
@@ -137,29 +139,13 @@ impl Nib {
             edge_direction: Vector2d::new(angle.cos(), -angle.sin()),
             half_length,
             half_thickness: half_length * NIB_THICKNESS_RATIO,
+            size: pen_size,
         }
     }
 
-    /// Returns the distance from the centre of the nib to the edge of the mark it leaves when
-    /// moved in the direction of the unit vector `tangent`, measured perpendicular to `tangent`.
-    ///
-    /// This is the support width of the nib ellipse in the direction across the stroke, so
-    /// offsetting the stroke's centreline by this amount on each side gives the outline of the
-    /// mark.
-    fn half_width_across(&self, tangent: Vector2d) -> f64 {
-        if !tangent.is_finite() {
-            // We have no direction to work with, so use something between the two extremes.
-            return 0.5 * (self.half_length + self.half_thickness);
-        }
-
-        // Sine and cosine of the angle between the direction of travel and the nib edge.
-        let sin = tangent.cross(self.edge_direction).abs();
-        let cos = tangent.dot(self.edge_direction).abs();
-
-        (self.half_length * sin).hypot(self.half_thickness * cos)
-    }
-
-    /// Appends the mark left by the nib resting at `centre` to `path_builder`.
+    /// Appends the mark left by the nib resting at `centre` to `path_builder`. This is a
+    /// parallelogram shaped like the nib itself: a line along the nib edge, thickened by the nib
+    /// thickness.
     fn append_mark(&self, centre: Point2d, path_builder: &mut PathBuilder) {
         let half_edge = self.edge_direction * self.half_length;
 
@@ -183,30 +169,18 @@ enum Spread {
         pen_size: f64,
         pressure_override: Option<f64>,
     },
-
-    /// A chisel-shaped nib, whose width depends on the direction of travel.
-    Chisel(Nib),
 }
 
 impl Spread {
     /// Returns the half-width of the mark made by the tool, measured across the stroke, when it is
     /// moved in the direction of the unit vector `tangent` under pressure `pressure`.
-    fn half_width_across(&self, pressure: f64, tangent: Vector2d) -> f64 {
-        match *self {
-            Spread::Round {
-                pen_size,
-                pressure_override,
-            } => pressure_to_circle_radius(pressure_override.unwrap_or(pressure), pen_size),
+    fn half_width_across(&self, pressure: f64, _tangent: Vector2d) -> f64 {
+        let Spread::Round {
+            pen_size,
+            pressure_override,
+        } = *self;
 
-            Spread::Chisel(nib) => nib.half_width_across(tangent),
-        }
-    }
-
-    fn nib(&self) -> Option<Nib> {
-        match *self {
-            Spread::Round { .. } => None,
-            Spread::Chisel(nib) => Some(nib),
-        }
+        pressure_to_circle_radius(pressure_override.unwrap_or(pressure), pen_size)
     }
 }
 
@@ -473,12 +447,14 @@ impl Tool {
             warn!("Dashed and dotted lines are not yet supported; will be drawn solid");
         }
 
-        let paths = if self.is_straight_only() {
-            Either::Left(strokes.into_iter().map(move |events| {
+        let mut paths: Vec<Path> = Vec::new();
+
+        if self.is_straight_only() {
+            for events in strokes {
                 let mut pb = PathBuilder::new();
                 append_events_straight(events, &mut pb);
-                pb.finish().unwrap()
-            }))
+                paths.push(pb.finish().unwrap());
+            }
         } else {
             // Increase the width for non-straight highlighters/markers.
             let size = if self.is_like_highlighter() {
@@ -490,37 +466,38 @@ impl Tool {
             // The calligraphy pen has a chisel-shaped nib held at a fixed angle, so its width
             // comes from the direction of travel rather than from the pressure. Every other
             // non-straight tool has a round nib.
-            let (spread, arc_mode, target_angle) = match *self {
-                Tool::CalligraphyPen { nib_angle_deg, .. } => (
-                    Spread::Chisel(Nib::new(nib_angle_deg.0.into(), size)),
-                    // The arcs are circular, so they are only the right shape for a round nib. A
-                    // chisel nib gets its ends from the shape of the nib itself instead, and does
-                    // not need anything at the joins because the width of a chisel nib varies
-                    // smoothly enough along the stroke for consecutive segments to meet flush.
-                    ArcMode::None,
-                    // A chisel nib changes width as the stroke turns, so segment more finely than
-                    // we need to for the shape alone.
-                    f64::to_radians(20.0),
-                ),
-
-                _ => (
-                    Spread::Round {
-                        pen_size: size,
-                        pressure_override: (!self.is_pressure_sensitive()).then_some(0.45),
-                    },
-                    ArcMode::All,
-                    f64::to_radians(40.0),
-                ),
+            let nib = match *self {
+                Tool::CalligraphyPen { nib_angle_deg, .. } => {
+                    Some(Nib::new(nib_angle_deg.0.into(), size))
+                }
+                _ => None,
             };
 
-            Either::Right(strokes.into_iter().filter_map(move |events| {
-                let mut pb = PathBuilder::new();
-                append_events_basic(events, spread, arc_mode, target_angle, &mut pb);
-                pb.finish()
-            }))
-        };
+            let spread = Spread::Round {
+                pen_size: size,
+                pressure_override: (!self.is_pressure_sensitive()).then_some(0.45),
+            };
 
-        self.draw_paths(paths, fill_boundary, surface);
+            let mut bodies: Vec<Path> = Vec::new();
+
+            for events in strokes {
+                let mut pb = PathBuilder::new();
+
+                if let Some(nib) = nib {
+                    append_events_chisel(events, nib, &mut pb);
+                } else {
+                    append_events_basic(events, spread, ArcMode::All, f64::to_radians(40.0), &mut pb);
+                }
+
+                if let Some(path) = pb.finish() {
+                    bodies.push(path);
+                }
+            }
+
+            paths.append(&mut bodies);
+        }
+
+        self.draw_paths(&paths, fill_boundary, surface);
 
         Ok(())
     }
@@ -960,9 +937,6 @@ fn append_simple_line(
 
 #[derive(Clone, Copy)]
 enum ArcMode {
-    /// Do not draw any arcs.
-    None,
-
     /// Draw arcs only on the first and last segments of the stroke.
     #[expect(dead_code)]
     FirstLastOnly,
@@ -983,7 +957,6 @@ impl SegmentArcs {
         use itertools::Position::{First, Last, Only};
 
         let (start, end) = match mode {
-            ArcMode::None => (false, false),
             ArcMode::All => (true, true),
 
             ArcMode::FirstLastOnly => {
@@ -1032,16 +1005,9 @@ fn append_events_basic<'e>(
         StrokeOrDot::Dot { x, y, pressure } => {
             let pos: Point2d = (x, y).into();
 
-            match spread.nib() {
-                // A chisel nib resting on the page leaves a mark shaped like the nib itself.
-                Some(nib) => nib.append_mark(pos, path_builder),
-
-                // Draw a filled circle.
-                None => {
-                    let radius = spread.half_width_across(pressure, Vector2d::zero());
-                    append_simple_line([(pos, radius), (pos, radius)], true, path_builder);
-                }
-            }
+            // Draw a filled circle.
+            let radius = spread.half_width_across(pressure, Vector2d::zero());
+            append_simple_line([(pos, radius), (pos, radius)], true, path_builder);
 
             return;
         }
@@ -1128,12 +1094,256 @@ fn append_events_basic<'e>(
             }
         }
     }
+}
 
-    // The segments have square ends, so stamp the nib down at each end of the stroke to give the
-    // flat, angled ends that a chisel nib leaves behind.
-    if let Some(nib) = spread.nib() {
-        nib.append_mark(smooth.position(0.0).into(), path_builder);
-        nib.append_mark(smooth.position(smooth.length()).into(), path_builder);
+/// Draws `events` into `path_builder` exactly the way Samsung's own calligraphy pen renderer does
+/// (the redraw path of `libSPenObliquePen.so`:
+/// `ObliquePenStrokeDrawableGLV1::GetDrawnPointData → redraw → redrawLine → drawPoint →
+/// ObliquePenStrokeDrawableRTV1::AddPoint`, with the live-path skirt geometry from
+/// `ObliquePenStrokeDrawableRTV1::lineToMesh`):
+///
+/// 1. **Point filter** (`redrawLine` entry check): a recorded point is only accepted when it is
+///    at least 1.5 pt away from the previously accepted point on either axis.
+/// 2. **Decimation** (`redrawLine`): movements closer than 5 pt (50 for finger input) are drawn
+///    only every other interval; the first movement after initialization only sets the control
+///    point. The control point slides on skipped intervals and is only committed on drawn ones.
+/// 3. **Quadratic smoothing** (`SmPath::rewind/moveTo/quadTo`): each drawn interval sweeps a
+///    quadratic Bézier from the previous anchor (the last sampled position) with the previous
+///    accepted point as control to the midpoint between it and the new point.
+/// 4. **Tessellation** (`SmPath::getLength`/`getPosTan` + the divisor table in `redrawLine`):
+///    each interval is divided into `max(int(L / divisor), 2) + 10` samples, where the divisor
+///    is selected by the pen size: `L/2` for sizes up to 5, then `3`, `L/4`, `5`, `L/8`, `7`,
+///    `9`, `10`. For a pen of size ~8 that is a constant 12 samples per interval.
+/// 5. **Nib sweep** (`ObliquePenStrokeDrawableRTV1::lineToMesh`): each sample interval sweeps
+///    out a parallelogram with corners at the interval endpoints offset by the constant diagonal
+///    `(±penSize / 2, ∓penSize / 2)`, joined to its neighbours along the shared cross-section.
+///    Two "skirt" quads (the live mesh's anti-aliasing gradients, filled opaquely here) extend
+///    the base edges by `2 × normalize(w ∓ u)` where `w` is the unit diagonal and `u` the
+///    direction of travel; they provide the minimum across-width on strokes drawn along the nib
+///    edge (≈ 0.28 × half the pen size, matching the constants `NIB_*` below). As in Samsung's
+///    renderer, event pressure and tilt play no part in the shape of the stroke body.
+fn append_events_chisel<'e>(
+    events: EventGroup<'e>,
+    nib: Nib,
+    path_builder: &mut PathBuilder,
+) {
+    let (events, _filtering) = match events {
+        EventGroup::Normal(events) => (events, FilteringMode::Raw),
+        EventGroup::Shapeified(events) => (events, FilteringMode::Preprocessed),
+    };
+
+    let raw_points = match StrokeOrDot::from_events(events) {
+        StrokeOrDot::Stroke(stroke) => stroke.points(),
+
+        StrokeOrDot::Dot { x, y, .. } => {
+            // A chisel nib resting on the page leaves a mark shaped like the nib itself.
+            nib.append_mark((x, y).into(), path_builder);
+
+            return;
+        }
+    };
+
+    // 1. Point filter.
+    let mut points = vec![raw_points[0]];
+
+    for &point in &raw_points[1..] {
+        let last = *points.last().expect("just pushed");
+
+        if (point.0 - last.0).abs() >= 1.5 || (point.1 - last.1).abs() >= 1.5 {
+            points.push(point);
+        }
+    }
+
+    // 2. + 3. The `redrawLine` state machine and per-interval tessellation. State: anchor (the
+    // path start of the next interval — re-anchored at the last *sampled* position), control
+    // (the Bézier control point, committed only on drawn intervals), prev (the last accepted
+    // raw point, used by both filters), and the decimation toggle.
+    let mut anchor = [points[0].0, points[0].1];
+    let mut control = anchor;
+    let mut prev = anchor;
+    let mut moved = true;
+    let mut first = true;
+
+    let mut intervals: Vec<([f64; 2], [f64; 2], [f64; 2], bool)> = Vec::new();
+
+    // The divisor table of `redrawLine`, indexed by the pen size (`getSize()`).
+    let divisor = |l: f64| -> f64 {
+        let size = nib.size;
+
+        if size <= 5.0 {
+            l / 2.0
+        } else if size <= 10.0 {
+            3.0
+        } else if size <= 15.0 {
+            l / 4.0
+        } else if size <= 20.0 {
+            5.0
+        } else if size <= 30.0 {
+            l / 8.0
+        } else if size <= 40.0 {
+            7.0
+        } else if size <= 55.0 {
+            9.0
+        } else {
+            10.0
+        }
+    };
+
+    for &point in &points[1..] {
+        let q = [point.0, point.1];
+        let (dx, dy) = (q[0] - prev[0], q[1] - prev[1]);
+
+        if dx.abs() < 1.5 && dy.abs() < 1.5 {
+            continue;
+        }
+
+        let dist = dx.hypot(dy);
+        let mut draw = false;
+
+        if dist >= 5.0 {
+            moved = true;
+
+            if first {
+                control = q;
+                first = false;
+            } else {
+                draw = true;
+            }
+        } else {
+            let was_moved = moved;
+            moved = !was_moved;
+
+            if !was_moved {
+                if first {
+                    control = q;
+                    first = false;
+                    prev = q;
+                    continue;
+                }
+
+                draw = true;
+            }
+        }
+
+        prev = q;
+
+        if draw {
+            let anchor_mid = [(control[0] + q[0]) / 2.0, (control[1] + q[1]) / 2.0];
+            intervals.push((anchor, control, anchor_mid, false));
+            anchor = anchor_mid;
+            control = q;
+        }
+    }
+
+    // `endPen`: the stroke always extends to the final *raw* event position — a quadratic when
+    // the pen was moving, a cubic through the control midpoint when it was stalled — subdivided
+    // with the same density table, inclusive of the end point.
+    let raw_last = [raw_points[raw_points.len() - 1].0, raw_points[raw_points.len() - 1].1];
+
+    if moved {
+        intervals.push((anchor, control, raw_last, true));
+    } else {
+        let mid = [(control[0] + raw_last[0]) / 2.0, (control[1] + raw_last[1]) / 2.0];
+        intervals.push((anchor, control, mid, false));
+        intervals.push((mid, mid, raw_last, true));
+    }
+
+    if intervals.is_empty() {
+        // Every point was within the decimation distance of the first: a dot.
+        nib.append_mark((points[0].0, points[0].1).into(), path_builder);
+
+        return;
+    }
+
+    // 4. Flatten each drawn interval. `redrawLine` samples `N = max(int(L / divisor), 2) + 10`
+    // positions at s = k·L/N for k = 0..N (the end included only on the final `endPen` stretch,
+    // whose intervals carry `inclusive_end`).
+    let mut samples: Vec<Point2d> = Vec::with_capacity(intervals.len() * 13);
+    samples.push(Point2d::new(intervals[0].0[0], intervals[0].0[1]));
+
+    for &(start, control, anchor, inclusive_end) in &intervals {
+        let l = ((control[0] - start[0]) * 2.0 + (anchor[0] - control[0]))
+            .hypot((control[1] - start[1]) * 2.0 + (anchor[1] - control[1]));
+        let n = ((l / divisor(l)) as usize).max(2) + 10;
+        let last_k = if inclusive_end { n } else { n - 1 };
+
+        for k in 1..=last_k {
+            let t = k as f64 / n as f64;
+            let u = 1.0 - t;
+
+            samples.push(Point2d::new(
+                u * u * start[0] + 2.0 * u * t * control[0] + t * t * anchor[0],
+                u * u * start[1] + 2.0 * u * t * control[1] + t * t * anchor[1],
+            ));
+        }
+    }
+
+    // Drop consecutive samples that coincide (the shared interval endpoints).
+    let mut deduped: Vec<Point2d> = Vec::with_capacity(samples.len());
+    deduped.push(samples[0]);
+    let eps = 0.05;
+
+    for &point in &samples[1..] {
+        let last = *deduped.last().expect("just pushed");
+
+        if (point.x - last.x).hypot(point.y - last.y) >= eps {
+            deduped.push(point);
+        }
+    }
+
+    let samples = deduped;
+
+    // 5. The nib sweep. `e` is the constant half-diagonal; each interval emits its base
+    // parallelogram plus the two skirt quads.
+    let half_edge = nib.edge_direction * nib.half_length;
+    let unit = |v: Vector2d| -> Vector2d {
+        let len = v.x.hypot(v.y);
+
+        if len > 0.0 {
+            Vector2d::new(v.x / len, v.y / len)
+        } else {
+            Vector2d::zero()
+        }
+    };
+
+    let mut last_sample: Option<Point2d> = None;
+
+    for &point in &samples {
+        if let Some(prev) = last_sample {
+            let u = unit(Vector2d::new(point.x - prev.x, point.y - prev.y));
+
+            if u.x == 0.0 && u.y == 0.0 {
+                continue;
+            }
+
+            let x3 = prev + half_edge;
+            let x4 = prev - half_edge;
+            let x5 = point + half_edge;
+            let x6 = point - half_edge;
+            let emit = |corners: [Point2d; 4], path_builder: &mut PathBuilder| {
+                // Normalize the winding so overlapping subpaths can't cancel under the non-zero
+                // fill rule.
+                let signed_area = (corners[1].x - corners[0].x) * (corners[2].y - corners[0].y)
+                    - (corners[1].y - corners[0].y) * (corners[2].x - corners[0].x);
+                let ordered = if signed_area < 0.0 {
+                    [corners[3], corners[2], corners[1], corners[0]]
+                } else {
+                    corners
+                };
+
+                path_builder.move_to(ordered[0].x as f32, ordered[0].y as f32);
+
+                for corner in &ordered[1..] {
+                    path_builder.line_to(corner.x as f32, corner.y as f32);
+                }
+
+                path_builder.close();
+            };
+
+            emit([x3, x4, x6, x5], path_builder);
+        }
+
+        last_sample = Some(point);
     }
 }
 
